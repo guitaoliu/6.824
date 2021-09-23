@@ -1,10 +1,17 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"path/filepath"
+	"sort"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -24,41 +31,139 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+type (
+	MapF    func(string, string) []KeyValue
+	ReduceF func(string, []string) string
+)
 
 //
 // main/mrworker.go calls this function.
 //
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
-
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
+func Worker(mapf MapF, reducef ReduceF) {
+	for {
+		task, nReduce, err := fetchTask()
+		if err != nil {
+			log.Fatalf("cannot fetch any task.")
+		}
+		switch task.Type {
+		case MapTask:
+			err := doMap(mapf, task, nReduce)
+			if err != nil {
+				log.Fatalf("connot process Map")
+			}
+			reportTask(task)
+		case ReduceTask:
+			err := doReduce(reducef, task)
+			if err != nil {
+				log.Fatalf("connot procee Reduce")
+			}
+			reportTask(task)
+		case ExitTask:
+			return
+		}
+	}
 }
 
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func doMap(mapf MapF, task *Task, nReduce int) error {
+	file, err := os.Open(task.File)
+	if err != nil {
+		log.Fatalf("cannot open %v", task.File)
+		return err
+	}
+	defer file.Close()
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", task.File)
+		return err
+	}
+	kva := mapf(task.File, string(content))
+	_ = kva
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+	files := make([]*os.File, nReduce)
+	buffers := make([]*bufio.Writer, nReduce)
+	encoders := make([]*json.Encoder, nReduce)
 
-	// fill in the argument(s).
-	args.X = 99
+	for i := 0; i < nReduce; i++ {
+		fileName := fmt.Sprintf("mr-%v-%v", task.Index, i)
+		files[i], err = os.Create(fileName)
+		if err != nil {
+			log.Fatalf("cannot open %v", fileName)
+		}
+		buffers[i] = bufio.NewWriter(files[i])
+		encoders[i] = json.NewEncoder(buffers[i])
+	}
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+	for _, kv := range kva {
+		idx := ihash(kv.Key) % nReduce
+		encoders[idx].Encode(&kv)
+	}
 
-	// send the RPC request, wait for the reply.
-	call("Coordinator.Example", &args, &reply)
+	for i := 0; i < nReduce; i++ {
+		err := buffers[i].Flush()
+		if err != nil {
+			log.Fatalf("cannot flush buffer %v", files[i].Name())
+		}
+		files[i].Close()
+	}
 
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+	return nil
+}
+
+func doReduce(reducef ReduceF, task *Task) error {
+	files, err := filepath.Glob(fmt.Sprintf("mr-%v-%v", "*", task.Index))
+	if err != nil {
+		log.Fatalf("connot obtain reduce files")
+	}
+
+	var kv KeyValue
+	kvMap := make(map[string][]string)
+
+	for _, filePath := range files {
+		file, err := os.Open(filePath)
+		if err != nil {
+			log.Fatalf("connot open file %v", filePath)
+		}
+		defer file.Close()
+		decoder := json.NewDecoder(file)
+		for decoder.More() {
+			decoder.Decode(&kv)
+			kvMap[kv.Key] = append(kvMap[kv.Key], kv.Value)
+		}
+	}
+
+	keys := []string{}
+	for k := range kvMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	outputFileName := fmt.Sprintf("mr-out-%v", task.Index)
+	file, err := os.Create(outputFileName)
+	if err != nil {
+		log.Fatalf("connot create file %v", outputFileName)
+	}
+
+	for _, key := range keys {
+		output := reducef(key, kvMap[key])
+		fmt.Fprintf(file, "%v %v\n", key, output)
+	}
+	file.Close()
+
+	return nil
+}
+
+func fetchTask() (*Task, int, error) {
+	args := &FetchTaskArgs{Worker: os.Getpid()}
+	reply := &FetchTaskReply{}
+	err := call("Coordinator.FetchTask", args, reply)
+	return reply.Task, reply.NReduce, err
+}
+
+func reportTask(task *Task) error {
+	args := &ReportTaskArgs{Task: task}
+	reply := &ReportTaskReply{}
+	err := call("Coordinator.ReportTask", args, reply)
+	return err
 }
 
 //
@@ -66,8 +171,7 @@ func CallExample() {
 // usually returns true.
 // returns false if something goes wrong.
 //
-func call(rpcname string, args interface{}, reply interface{}) bool {
-	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
+func call(rpcname string, args interface{}, reply interface{}) error {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
@@ -76,10 +180,5 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	defer c.Close()
 
 	err = c.Call(rpcname, args, reply)
-	if err == nil {
-		return true
-	}
-
-	fmt.Println(err)
-	return false
+	return err
 }
